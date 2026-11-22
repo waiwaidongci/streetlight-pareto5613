@@ -1,17 +1,17 @@
 """台账关联、灯组集中度测算和夜巡分流。"""
 
 from collections import Counter
-from datetime import date
+from datetime import date, datetime
 from fractions import Fraction
 from itertools import accumulate
 
 from .spec import SPEC
 
 
-_REGISTER, _INCIDENT = SPEC["fields"][0]["options"]
+_REGISTER, _REPORT, _INCIDENT = SPEC["fields"][0]["options"]
 _DISPATCH, _OBSERVE, _ARCHIVE = SPEC["modes"]
 _SITE_COLUMNS = (
-    ("site_id", "灯组编号"), ("district", "片区"), ("site_name", "台账点位"),
+    ("site_id", "灯组编号"), ("district", "片区"), ("site_name", "点位"),
     ("fixture_count", "在册灯具数"), ("incident_count", "工单数"),
 )
 
@@ -32,18 +32,29 @@ def _date(value, label):
     raise ValueError(f"{label}须使用有效的 YYYY-MM-DD 日期。")
 
 
+def _datetime(value, label):
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            pass
+    raise ValueError(f"{label}须使用有效的 YYYY-MM-DD HH:MM 报障时间。")
+
+
 def _blank(value):
     return value is None or (isinstance(value, str) and not value.strip())
 
 
 def validate_rows(rows):
-    """校验全量台账和工单，返回去除空字段的独立记录。"""
+    """校验全量台账、原始报障和工单，返回去除空字段的独立记录。"""
     if not isinstance(rows, (list, tuple)) or not rows:
         raise ValueError("灯组与工单明细为空，请导入灯组台账。")
 
     sites = set()
     incident_ids = set()
+    report_refs = set()
     incidents = []
+    raw_reports = []
     records = []
     for index, row in enumerate(rows, start=1):
         if not isinstance(row, dict):
@@ -54,8 +65,9 @@ def validate_rows(rows):
         if kind == _REGISTER:
             if site_id in sites:
                 raise ValueError(f"灯组编号「{site_id}」在台账中重复。")
-            if any(not _blank(row.get(key)) for key in ("incident_id", "report_date")):
-                raise ValueError(f"灯组「{site_id}」的台账行须留空工单号和报修日期。")
+            if any(not _blank(row.get(key)) for key in
+                   ("incident_id", "report_date", "report_ref", "source", "occurred_at", "legacy_order")):
+                raise ValueError(f"灯组「{site_id}」的台账行须留空工单与报障字段。")
             fixtures = row.get("fixture_count")
             if type(fixtures) is not int or fixtures < 1:
                 raise ValueError(f"灯组「{site_id}」的在册灯具数须为正整数。")
@@ -77,8 +89,30 @@ def validate_rows(rows):
             )
             incident_ids.add(incident_id)
             incidents.append(record)
+        elif kind == _REPORT:
+            ref = _text(row.get("report_ref"), f"第 {index} 条记录的原始报障编号")
+            if ref in report_refs:
+                raise ValueError(f"原始报障编号「{ref}」重复。")
+            source = row.get("source")
+            if _blank(source) or source not in SPEC["report_sources"]:
+                raise ValueError(f"报障「{ref}」的报障来源须为「{'」或「'.join(SPEC['report_sources'])}」。")
+            occurred = _datetime(row.get("occurred_at"), f"报障「{ref}」的报障时间")
+            if any(not _blank(row.get(key)) for key in
+                   ("district", "site_name", "fixture_count", "incident_id", "report_date")):
+                raise ValueError(f"报障「{ref}」的报障行须留空台账与工单字段。")
+            legacy = row.get("legacy_order")
+            if not _blank(legacy):
+                legacy = legacy.strip()
+            record.update(
+                report_ref=ref, source=source, occurred_at=occurred.isoformat(),
+                legacy_order=legacy or None,
+            )
+            report_refs.add(ref)
+            raw_reports.append(record)
         else:
-            raise ValueError(f"第 {index} 条记录的记录类型须为「{_REGISTER}」或「{_INCIDENT}」。")
+            raise ValueError(
+                f"第 {index} 条记录的记录类型须为「{_REGISTER}」「{_REPORT}」或「{_INCIDENT}」。"
+            )
         records.append(record)
 
     if not sites:
@@ -86,6 +120,9 @@ def validate_rows(rows):
     for incident in incidents:
         if incident["site_id"] not in sites:
             raise ValueError(f"工单「{incident['incident_id']}」未匹配灯组「{incident['site_id']}」，请补录或更正台账。")
+    for item in raw_reports:
+        if item["site_id"] not in sites:
+            raise ValueError(f"报障「{item['report_ref']}」未匹配灯组「{item['site_id']}」，请补录或更正台账。")
     return records
 
 
@@ -151,7 +188,31 @@ def _triage(ranked, min_incidents, min_rate):
     return [site for _, site in sorted(queue)]
 
 
-def analyze(rows, normalized_params):
+def _incidents_from_consolidation(payload, sites, start, end):
+    """把生效归并版本中的工单转换为集中度测算使用的工单行，并保留报障溯源。
+
+    工单的报修日期取组内最早报障时间的日期；日期筛选与旧工单口径一致（含首尾）。
+    返回 (工单行列表, 工单号到原始报障列表的映射)。
+    """
+    incidents = []
+    trace_map = {}
+    for order in payload.get("orders", []):
+        if order["site_id"] not in sites:
+            continue
+        first_day = order["first_at"][:10]
+        if (start and first_day < start) or (end and first_day > end):
+            continue
+        incidents.append({
+            "incident_id": order["order_no"],
+            "report_date": first_day,
+            "site_id": order["site_id"],
+        })
+        trace_map[order["order_no"]] = order.get("reports", [])
+    incidents.sort(key=lambda row: (row["report_date"], row["incident_id"]))
+    return incidents, trace_map
+
+
+def analyze(rows, normalized_params, consolidation=None):
     records = validate_rows(rows)
     options = _parameters(normalized_params)
     district, start, end = (options[key] for key in ("district_scope", "start_date", "end_date"))
@@ -161,11 +222,23 @@ def analyze(rows, normalized_params):
     }
     if not sites:
         raise ValueError(f"台账中没有「{district}」的灯组，请检查片区名称。")
-    incidents = sorted(
-        (row for row in records if row["record_type"] == _INCIDENT and row["site_id"] in sites
-         and (not start or row["report_date"] >= start) and (not end or row["report_date"] <= end)),
-        key=lambda row: (row["report_date"], row["incident_id"]),
-    )
+
+    trace_map = {}
+    if consolidation is not None:
+        # 集中度只读取当前生效归并版本的工单，实现「补录/改判后一次性切换」。
+        incidents, trace_map = _incidents_from_consolidation(consolidation, sites, start, end)
+        consolidation_meta = {
+            "version_id": consolidation.get("version_id"),
+            "version_no": consolidation.get("version_no"),
+            "order_count": consolidation.get("statistics", {}).get("order_count"),
+        }
+    else:
+        incidents = sorted(
+            (row for row in records if row["record_type"] == _INCIDENT and row["site_id"] in sites
+             and (not start or row["report_date"] >= start) and (not end or row["report_date"] <= end)),
+            key=lambda row: (row["report_date"], row["incident_id"]),
+        )
+        consolidation_meta = None
     counts = Counter(row["site_id"] for row in incidents)
     ranked = sorted(sites.values(), key=lambda site: (-counts[site["site_id"]], site["site_id"]))
     ranked = [
@@ -193,11 +266,19 @@ def analyze(rows, normalized_params):
     ]
     queue = _triage(ranked, options["min_incidents"], options["min_rate"])
     dispatch_count = sum(site["action"] == _DISPATCH for site in queue)
-    trace = [
-        {"incident_id": row["incident_id"], "report_date": row["report_date"], "site_id": row["site_id"],
-         "site_name": sites[row["site_id"]]["site_name"]}
-        for row in incidents
-    ]
+    trace = []
+    for row in incidents:
+        item = {"incident_id": row["incident_id"], "report_date": row["report_date"],
+                "site_id": row["site_id"], "site_name": sites[row["site_id"]]["site_name"]}
+        sources = trace_map.get(row["incident_id"])
+        if sources is not None:
+            item["raw_report_count"] = len(sources)
+            item["raw_report_refs"] = "、".join(report["report_ref"] for report in sources)
+            source_order = {"热线": 0, "巡检": 1}
+            item["sources"] = "、".join(
+                sorted({report["source"] for report in sources},
+                       key=lambda value: source_order.get(value, 99)))
+        trace.append(item)
     if dispatch_count:
         first = queue[0]
         next_step = f"优先将灯组 {first['site_id']}「{first['site_name']}」及对应工单交给夜巡，再登记现场结果。"
@@ -206,11 +287,20 @@ def analyze(rows, normalized_params):
     else:
         next_step = "本期无报修工单。按台账归档，并在下一周期复核新增工单。"
 
-    return {
+    trace_columns = [
+        ("incident_id", "暗区工单号"), ("report_date", "报修日期"),
+        ("site_id", "灯组编号"), ("site_name", "台账点位"),
+    ]
+    if trace_map:
+        trace_columns += [
+            ("raw_report_count", "原始报障数"), ("sources", "报障来源"), ("raw_report_refs", "原始报障编号"),
+        ]
+    result = {
         "state": "warning" if dispatch_count else "ok",
         "headline": f"{total} 张暗区工单分布在 {len(counts)}/{n} 个灯组，建议夜巡 {dispatch_count} 组。",
         "note": (f"{district or '全部片区'} · 报修起日 {start or '不限'} · 报修止日 {end or '不限'}。"
                  f"零报修灯组 {zero_count} 组，均计入灯组数。"),
+        "consolidation": consolidation_meta,
         "metrics": [
             {"label": "在册灯组", "value": n, "detail": f"在册灯具 {sum(site['fixture_count'] for site in ranked)} 盏"},
             {"label": "纳入工单", "value": total, "detail": f"涉及 {len(counts)} 个灯组"},
@@ -226,9 +316,7 @@ def analyze(rows, normalized_params):
             _table("灯组夜巡分流", _SITE_COLUMNS + (
                 ("rate_per_100", "每百盏报修数"), ("action", "建议处置"), ("next_step", "交接事项"),
             ), queue),
-            _table("纳入工单明细", (
-                ("incident_id", "暗区工单号"), ("report_date", "报修日期"), ("site_id", "灯组编号"), ("site_name", "台账点位"),
-            ), trace),
+            _table("纳入工单明细（含原始报障溯源）", tuple(trace_columns), trace),
         ],
         "charts": [
             _curve("洛伦兹曲线 · 累计工单占比（%）", ascending, total),
@@ -236,3 +324,4 @@ def analyze(rows, normalized_params):
         ],
         "sections": [{"title": "夜巡交接与复核", "text": next_step}],
     }
+    return result

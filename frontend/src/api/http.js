@@ -1,7 +1,9 @@
 export class ApiError extends Error {
-  constructor(message, status) {
+  constructor(message, status, detail) {
     super(message);
     this.status = status;
+    this.detail = detail;
+    this.contradictions = detail?.contradictions || null;
   }
 }
 
@@ -15,7 +17,10 @@ export async function request(path, {token, body, download = false} = {}) {
   });
   if (!response.ok) {
     const problem = await response.json().catch(() => ({}));
-    throw new ApiError(problem.detail || `请求失败 (${response.status})`, response.status);
+    const detail = typeof problem.detail === 'string' ? null : problem.detail;
+    const message = typeof problem.detail === 'string' ? problem.detail
+      : (problem.detail?.message || `请求失败 (${response.status})`);
+    throw new ApiError(message, response.status, detail);
   }
   return download ? response.blob() : response.json();
 }

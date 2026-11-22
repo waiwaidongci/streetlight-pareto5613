@@ -28,3 +28,9 @@ class ScheduleRequest(RunRequest):
     recipient: str = Field(min_length=1, max_length=100)
     first_at: datetime
     repeat_daily: bool = False
+
+class JudgmentRequest(Request):
+    left_ref: str = Field(min_length=1, max_length=64)
+    right_ref: str = Field(min_length=1, max_length=64)
+    relation: str = Field(min_length=1, max_length=20)
+    note: str = Field(default='', max_length=500)

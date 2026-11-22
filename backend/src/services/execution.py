@@ -5,6 +5,7 @@ from src.config.database import Session
 from src.constants.enums import Status
 from src.domain.analysis import analyze
 from src.domain.spec import SPEC
+from src.models.consolidation import ConsolidationVersion
 from src.models.jobs import Delivery, Run, Schedule
 from src.models.source import Dataset
 from src.services.audit import record
@@ -57,15 +58,27 @@ def claim():
         job.status = Status.RUNNING
         job.attempt += 1
         job.lease_until = stamp + timedelta(minutes=3)
-        records = db.get(Dataset, job.dataset_id).rows
-        return job.id, job.attempt, records, job.params
+        dataset = db.get(Dataset, job.dataset_id)
+        records = dataset.rows
+        active = db.scalar(
+            select(ConsolidationVersion).where(
+                ConsolidationVersion.dataset_id == job.dataset_id,
+                ConsolidationVersion.is_active.is_(True),
+            )
+        )
+        consolidation = None
+        if active is not None:
+            consolidation = dict(active.payload)
+            consolidation["version_id"] = active.id
+            consolidation["version_no"] = active.version_no
+        return job.id, job.attempt, records, job.params, consolidation
 
 
 def execute(lease):
-    job_id, attempt, rows, params = lease
+    job_id, attempt, rows, params, consolidation = lease
     result = export = failure = None
     try:
-        result = analyze(rows, params)
+        result = analyze(rows, params, consolidation=consolidation)
         export = write_report(job_id, attempt, result)
     except ValueError as error:
         failure = str(error)[:500]

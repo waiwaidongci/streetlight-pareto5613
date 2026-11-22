@@ -27,3 +27,22 @@ def schedule(item):
 def delivery(item):
     return {'id': item.id, 'run_id': item.run_id, 'recipient': item.recipient,
             'state': item.state, 'detail': item.detail, 'created_at': iso(item.created_at)}
+
+
+def judgment(item):
+    return {'id': item.id, 'dataset_id': item.dataset_id, 'left_ref': item.left_ref,
+            'right_ref': item.right_ref, 'relation': item.relation, 'note': item.note,
+            'author': item.author, 'created_at': iso(item.created_at)}
+
+
+def consolidation_version(item, detail=False):
+    view = {'id': item.id, 'dataset_id': item.dataset_id, 'version_no': item.version_no,
+            'is_active': item.is_active, 'status': item.status, 'author': item.author,
+            'created_at': iso(item.created_at), 'activated_at': iso(item.activated_at),
+            'statistics': item.payload.get('statistics') if item.payload else None,
+            'contradictions': item.contradictions}
+    if detail:
+        view['payload'] = item.payload
+        view['judgment_fingerprint'] = item.judgment_fingerprint
+        view['input_fingerprint'] = item.input_fingerprint
+    return view
